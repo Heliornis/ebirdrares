@@ -1,0 +1,206 @@
+library(shiny)
+library(shinydashboard)
+library(shinythemes)
+library(leaflet)
+library(leaflet.extras)
+library(rebird)
+
+# Adding choices for Region Code input
+choices = as.character(read.csv("./data/choices.csv")$x)
+
+# Making my location icon
+uloc = makeIcon(iconUrl = "./uloc.png", iconHeight = 25, iconWidth = 25)
+
+### STARTING APP ### --------------------------------------------------------
+ui <- bootstrapPage(
+  
+  # Adding dynamically updating user location
+  tags$script('
+              $(document).ready(function () {
+              
+              function getLocation(callback){
+              var options = {
+              enableHighAccuracy: true,
+              timeout: 5000,
+              maximumAge: 0
+              };
+              
+              navigator.geolocation.getCurrentPosition(onSuccess, onError);
+              
+              function onError (err) {
+              Shiny.onInputChange("geolocation", false);
+              }
+              
+              function onSuccess (position) {
+              setTimeout(function () {
+              var coords = position.coords;
+              var timestamp = new Date();
+              
+              console.log(coords.latitude + ", " + coords.longitude, "," + coords.accuracy);
+              Shiny.onInputChange("geolocation", true);
+              Shiny.onInputChange("lat", coords.latitude);
+              Shiny.onInputChange("long", coords.longitude);
+              Shiny.onInputChange("accuracy", coords.accuracy);
+              Shiny.onInputChange("time", timestamp)
+              
+              console.log(timestamp);
+              
+              if (callback) {
+              callback();
+              }
+              }, 1100)
+              }
+              }
+              
+              var TIMEOUT = 3000; //SPECIFY
+              var started = false;
+              function getLocationRepeat(){
+              //first time only - no delay needed
+              if (!started) {
+              started = true;
+              getLocation(getLocationRepeat);
+              return;
+              }
+              
+              setTimeout(function () {
+              getLocation(getLocationRepeat);
+              }, TIMEOUT);
+              
+              };
+              
+              getLocationRepeat();
+              
+              });
+              '),
+  
+    theme = shinytheme("superhero"),
+    
+    # Setting map to full-screen
+    tags$style(type="text/css", "html, body {width:100%;height:100%}"),
+    
+    # Initializing leaflet output
+    leafletOutput("myMap", width="100%", height="100%"),
+    
+    # Adding title overlayed on leaflet map
+    absolutePanel(top = 1, left = 50, draggable = T, 
+                  titlePanel("eBird Rarity Viewer")),
+    
+    # Adding slider input overlayed on leaflet map
+    absolutePanel(bottom = 1, left = 45, draggable = T, 
+                  sliderInput("slider_in", "Days Back", min = 1, max = 30, value = 14, round = T)),
+    
+    # Adding select text input overlayed on leaflet map
+    absolutePanel(top = 1, right = 45, draggable = T,
+                  selectInput("region_in", "Region Code", choices = choices, selected = "US-MA", multiple = F, width  = 130))
+
+    
+    # TODO: FIGURE OUT THIS SPECIES INPUT:
+    
+    ## Adding select text input overlayed on leaflet map
+    #absolutePanel(top = 40, left = 45, draggable = T,
+    #              textInput("species_in", "Species", placeholder = "Long-eared Owl"))
+        
+    # Adding text input overlayed on leaflet map
+    #absolutePanel(top = 1, right = 45, draggable = T,
+                  #textInput("region_in", "Region Code", value = "", placeholder = "US-MA"))
+                  #submitButton("", icon("refresh")))
+)
+
+server <- function(input, output) {
+  
+  # Rendering data frame from API with slider input
+  APIdata <- reactive({
+    
+    # Initial fetch of data from eBird API, with conditionals to work around input errors.
+    a <- try(ebirdnotable(region = as.character(input$region_in), back = as.numeric(input$slider_in)))
+    if(class(a) == "try-error" ||length(a) == 0){return(NULL)}
+    
+    ## Adding species search
+    #b <- try(a[a$comName == as.character(species_in),])
+    #if(class(b) == "try-error" ||length(b) == 0){a = a} # need to figure out how to keep going
+    
+    # Going back
+    # a = b
+    
+    # Changing review status from logical to numeric
+    cols <- sapply(a, is.logical)
+    a[,cols] <- lapply(a[,cols], as.numeric)
+  
+    # Initializing new date column
+    a["date"] <- format(strptime(a$obsDt, format = "%Y-%m-%d"), "%b %d")
+    
+    # Initializing new color grouping column
+    a["group"] <- NA
+  
+    # Assigning colors by review status
+    idx<-  (a$obsReviewed == 0) # Not reviewed
+    a$group[idx] <- "white"
+    idx<- (a$obsReviewed == 1) & (a$obsValid == 1) # Reviewed and accepted
+    a$group[idx] <- "green"
+  
+    # Jittering lat/lon points to fix point overlap
+    a$lat = jitter(a$lat, factor = 3) 
+    
+    # print(a)
+    return(a)
+  })
+  
+  # Adding dynamically updating user location
+  observe({
+    if(!is.null(input$lat)){
+      
+      lat <- input$lat
+      lng <- input$long
+      acc <- input$accuracy
+      time <- input$time
+      
+      proxy <- leafletProxy("myMap")
+      
+      proxy  %>% 
+        clearGroup(group="pos") %>% 
+        addMarkers(icon = uloc,lng=lng, lat=lat, label = "My Location", popup=paste("My location is:","<br>",
+                                                 lng,"Longitude","<br>",
+                                                 lat,"Latitude", "<br>",
+                                                 "My accuracy is:",  "<br>",
+                                                 acc, "meters"),
+                   group="pos") %>%
+        addCircles(lng=lng, lat=lat, radius=acc, group="pos") 
+      
+    }
+    
+  })
+  
+  # Leaflet map
+  output$myMap = renderLeaflet({
+    if(is.null(APIdata()))
+    {
+      # Rendering leaflet map
+      return(leaflet() %>% addTiles()) %>%
+        addSearchOSM(options = searchOSMOptions(zoom = 8)) %>%
+        setView(-19.451108, 30.479968, 2)
+    }
+    else
+    {
+      # Splitting up by review status in order to show reviewed on top
+      notReviewed = APIdata()[APIdata()$group == "white",]
+      accepted = APIdata()[APIdata()$group == "green",]
+    
+      # Rendering leaflet map
+      leaflet() %>% addTiles() %>%
+      #addCircleMarkers(color = ~group, label = paste(APIdata()$comName,",",APIdata()$obsDt), labelOptions = labelOptions(noHide = F, direction = 'auto')) %>% # popup = paste("<a href = http://www.ebird.org/ebird/hotspot/",APIdata()$locID,"> ",APIdata()$locID," </a>", sep=)
+      addCircleMarkers(data = notReviewed, color = "#f5f5dc", opacity = 0.7, label = paste(notReviewed$comName,", ",notReviewed$date, ", ", notReviewed$locName,sep = "")) %>% # , labelOptions = labelOptions(noHide = F, direction = 'auto')) %>%
+      addCircleMarkers(data = accepted, color = "#00FF33", opacity = 0.7, label = paste(accepted$comName,", ",accepted$date, ", ", accepted$locName, sep = "")) %>% # , labelOptions = labelOptions(noHide = F, direction = 'auto')) %>%
+      #addEasyButton(easyButton(position = "topleft",
+      #                          icon="fa-crosshairs", title="Locate Me",
+      #                          onClick=JS("function(btn, map){ map.locate({setView: true}); }"))) %>%
+      addLegend(position = "bottomright", 
+                  colors = c("#f5f5dc", "#00FF33"), 
+                  labels = c("Not reviewed", "Accepted"),
+                  title = "Legend: review status", opacity = 1) %>%
+      addSearchOSM(options = searchOSMOptions(zoom = 8))
+    }
+   })
+}
+
+# Run the application 
+shinyApp(ui = ui, server = server)
